@@ -1,0 +1,493 @@
+# Links and Monitors
+
+## Spawning a Simple Process
+
+Let's spawn a process which is doing nothing and is only waiting for a specific message to exit
+
+```elixir
+defmodule Process1 do
+  def loop do
+    receive do
+      :quit -> :ok
+    end
+  end
+end
+
+pid = spawn(Process1, :loop, [])
+```
+
+```elixir
+Process.alive?(pid)
+```
+
+```elixir
+send(pid, :quit)
+```
+
+```elixir
+Process.alive?(pid)
+```
+
+## Two Processes Unaware of Each Other
+
+Without links or monitors when a process crashes it has no effect on other processes.
+
+```elixir
+defmodule Process1 do
+  def loop do
+    receive do
+      :quit ->
+        :ok
+
+      {:spawn_process_2, sender} ->
+        #                           MFA
+        process2_pid = spawn(Process2, :loop, [])
+        send(sender, {:process2_pid, process2_pid})
+        loop()
+    end
+  end
+end
+
+defmodule Process2 do
+  def loop do
+    receive do
+      :quit ->
+        :ok
+
+      :crash_and_burn ->
+        _a = 1 / 0
+        loop()
+    end
+  end
+end
+
+pid = spawn(Process1, :loop, [])
+```
+
+```elixir
+Process.alive?(pid)
+```
+
+```elixir
+send(pid, {:spawn_process_2, self()})
+
+process2_pid =
+  receive do
+    {:process2_pid, p} -> p
+  end
+```
+
+```elixir
+{Process.alive?(pid), Process.alive?(process2_pid)}
+```
+
+```elixir
+send(process2_pid, :crash_and_burn)
+```
+
+```elixir
+{Process.alive?(pid), Process.alive?(process2_pid)}
+```
+
+```elixir
+send(pid, :quit)
+```
+
+## Link Between Two Processes
+
+When two processes are linked, when one of them crashes, the other crashes, too.
+
+```elixir
+defmodule Process1 do
+  def loop do
+    receive do
+      :quit ->
+        :ok
+
+      {:spawn_process_2, sender} ->
+        process2_pid = spawn(Process2, :loop, [])
+        # ↓ ↓ ↓ the only new line compared to the previous example!
+        Process.link(process2_pid)
+        send(sender, {:process2_pid, process2_pid})
+        loop()
+    end
+  end
+end
+
+defmodule Process2 do
+  def loop do
+    receive do
+      :quit ->
+        :ok
+
+      :crash_and_burn ->
+        _a = 1 / 0
+        loop()
+    end
+  end
+end
+
+pid = spawn(Process1, :loop, [])
+```
+
+```elixir
+send(pid, {:spawn_process_2, self()})
+
+process2_pid =
+  receive do
+    {:process2_pid, p} -> p
+  end
+```
+
+```elixir
+{Process.alive?(pid), Process.alive?(process2_pid)}
+```
+
+```elixir
+send(process2_pid, :crash_and_burn)
+```
+
+```elixir
+{Process.alive?(pid), Process.alive?(process2_pid)}
+```
+
+### Correction!
+
+The problem with the code above is that we first spawn a process and then we link it.
+**That spawned process could crash before a link is established!**.
+To solve that problem, the platform offers
+`spawn_link` - an atomic opertion which spawns a process and links it in one go.
+With `spawn_link` the code above looks as follows:
+
+```elixir
+defmodule Process1 do
+  def loop do
+    receive do
+      :quit ->
+        :ok
+
+      {:spawn_process_2, sender} ->
+        process2_pid = spawn_link(Process2, :loop, [])
+        send(sender, {:process2_pid, process2_pid})
+        loop()
+    end
+  end
+end
+```
+
+If you've already done some OTP coding you've seen that a convention for naming functions which start
+new genservers or supervisors is `start_link`. Now you know why. `start_link` means
+*start a new process linked to the current process*.
+
+## Links are Bidirectional
+
+Instead of crashing the process spawned from module `Process2`, like we did in
+the previous section, let's crash the other process, the one spawned from module `Process1`:
+
+```elixir
+defmodule Process1 do
+  def loop do
+    receive do
+      :quit ->
+        :ok
+
+      {:spawn_process_2, sender} ->
+        process2_pid = spawn_link(Process2, :loop, [])
+        send(sender, {:process2_pid, process2_pid})
+        loop()
+
+      :crash_and_burn ->
+        _a = 1 / 0
+        loop()
+    end
+  end
+end
+
+defmodule Process2 do
+  def loop do
+    receive do
+      :quit -> :ok
+    end
+  end
+end
+
+pid = spawn(Process1, :loop, [])
+```
+
+```elixir
+send(pid, {:spawn_process_2, self()})
+
+process2_pid =
+  receive do
+    {:process2_pid, p} -> p
+  end
+```
+
+```elixir
+{Process.alive?(pid), Process.alive?(process2_pid)}
+```
+
+```elixir
+send(pid, :crash_and_burn)
+```
+
+```elixir
+{Process.alive?(pid), Process.alive?(process2_pid)}
+```
+
+Links are bidirectional!
+
+Imagine that process A is linked to process B, and B is linked to process C, and so on.
+If any process in this set crashes, all processes in the link set will eventually crash, too, even if
+there is no direct link between some of these processes.
+
+In OTP we have supervisors, one of the functions of supervisors
+to form boundaries between crashing processes, and to manage crashes.
+How exactly supervisors do it is shown in the next section.
+
+## Trapping Exits Of Linked Processes
+
+Instead of crashing on an exit of a linked process, we can give a process a *superpower* to intercept exits as
+messages
+with information about a crashed linked process.
+
+The message is a 3-element tuple:
+`{:EXIT, pid, reason}` where
+
+* `pid` is the pid of the linked process which exited
+* `reason` is a data structure describing why that process crashed
+
+The type spec of this message is:
+
+```
+{:EXIT, pid(), any()}
+```
+
+```elixir
+defmodule Process1 do
+  def init do
+    # ↓ ↓ ↓ superpower!
+    Process.flag(:trap_exit, true)
+    loop(nil)
+  end
+
+  def loop(state) do
+    receive do
+      :quit ->
+        :ok
+
+      {:spawn_process_2, sender} ->
+        process2_pid = spawn_link(Process2, :loop, [])
+        send(sender, {:process2_pid, process2_pid})
+        loop(state)
+
+      # waiting for an EXIT message!
+      {:EXIT, pid, reason} ->
+        new_state = %{linked_process_pid: pid, exit_reason: reason}
+        loop(new_state)
+
+      # send the state to a sender process
+      {:show_state, sender} ->
+        send(sender, {:state, state})
+        loop(state)
+    end
+  end
+end
+
+defmodule Process2 do
+  def loop do
+    receive do
+      :quit ->
+        :ok
+
+      :crash_and_burn ->
+        _a = 1 / 0
+        loop()
+    end
+  end
+end
+
+pid = spawn(Process1, :init, [])
+```
+
+```elixir
+send(pid, {:spawn_process_2, self()})
+
+process2_pid =
+  receive do
+    {:process2_pid, p} -> p
+  end
+```
+
+```elixir
+send(process2_pid, :crash_and_burn)
+```
+
+```elixir
+{Process.alive?(pid), Process.alive?(process2_pid)}
+```
+
+```elixir
+send(pid, {:show_state, self()})
+
+receive do
+  {:state, s} -> s
+end
+```
+
+## Normal Exits
+
+Actually, a process can trap not only crashes of linked processes. A process can trap normal exits,
+when a linked process finishes and exits *"peacefully and patriotically"* ©.
+
+In this case `:reason` is always atom `:normal`.
+
+```elixir
+defmodule Process1 do
+  def init do
+    Process.flag(:trap_exit, true)
+
+    spawn_link(fn ->
+      :do_nothing_end_exit
+    end)
+
+    loop(nil)
+  end
+
+  def loop(state) do
+    receive do
+      :quit ->
+        :ok
+
+      {:EXIT, pid, reason} ->
+        new_state = %{linked_process_pid: pid, exit_reason: reason}
+        loop(new_state)
+
+      {:show_state, sender} ->
+        send(sender, {:state, state})
+        loop(state)
+    end
+  end
+end
+
+pid = spawn(Process1, :init, [])
+```
+
+```elixir
+send(pid, {:show_state, self()})
+
+receive do
+  {:state, state} -> state
+end
+```
+
+## Killing a Process Which Does Not Trap Exit Signals
+
+It is possible to kill a process with `Process.exit(pid, reason)`:
+
+```elixir
+defmodule Process1 do
+  def loop do
+    receive do
+      _ -> loop()
+    end
+  end
+end
+
+pid = spawn(Process1, :loop, [])
+```
+
+```elixir
+Process.alive?(pid)
+```
+
+```elixir
+Process.exit(pid, :please_die)
+```
+
+```elixir
+Process.alive?(pid)
+```
+
+## Process.exit() For Processes Which Trap Exit Signals
+
+But if we set the process to trap exit signals it will not die.
+Instead it will be receiving exit signals
+
+```elixir
+defmodule Process1 do
+  def init do
+    Process.flag(:trap_exit, true)
+    loop(nil)
+  end
+
+  def loop(state) do
+    receive do
+      {:EXIT, pid, reason} ->
+        new_state = %{linked_process_pid: pid, exit_reason: reason}
+        loop(new_state)
+
+      {:show_state, sender} ->
+        send(sender, {:state, state})
+        loop(state)
+    end
+  end
+end
+
+pid = spawn(Process1, :init, [])
+```
+
+```elixir
+Process.exit(pid, :please_die)
+```
+
+```elixir
+Process.alive?(pid)
+```
+
+```elixir
+send(pid, {:show_state, self()})
+
+receive do
+  {:state, state} -> state
+end
+```
+
+## Killing a Process Which Traps Exit Signals
+
+Message `:kill` is special and stops even processes which trap exits.
+
+```elixir
+defmodule Process1 do
+  def init do
+    Process.flag(:trap_exit, true)
+    loop(nil)
+  end
+
+  def loop(state) do
+    receive do
+      {:EXIT, pid, reason} ->
+        new_state = %{linked_process_pid: pid, exit_reason: reason}
+        loop(new_state)
+
+      {:show_state, sender} ->
+        send(sender, {:state, state})
+        loop(state)
+    end
+  end
+end
+
+pid = spawn(Process1, :init, [])
+```
+
+```elixir
+Process.alive?(pid)
+```
+
+```elixir
+Process.exit(pid, :kill)
+```
+
+```elixir
+Process.alive?(pid)
+```

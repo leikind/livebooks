@@ -491,3 +491,348 @@ Process.exit(pid, :kill)
 ```elixir
 Process.alive?(pid)
 ```
+
+## Summary
+
+* Links are bidirectional
+* If a process crashes, all linked processes crash, too
+* Unless flag `trap_exit` is set to `true`, in that case a message is sent
+* `Process.exit` kills processes where `trap_exit` is NOT set to `true`
+* `Process.exit(pid, :kill)` kills processes where `trap_exit` is set to `true`
+
+## Monitors: A Simple Example
+
+* Monitors are not bidirectional: there is a monitored process and a monitoring process
+* A monitor between 2 processes does not cause a monitoring process to crash or exit
+* Each monitor has a corresponding unique reference which can be stored in ETS or Mnesia or elsewhere
+
+```elixir
+defmodule Process1 do
+  def loop do
+    receive do
+      :crash_and_burn ->
+        _a = 1 / 0
+        loop()
+    end
+  end
+end
+
+defmodule Process2 do
+  def init(pid_to_monitor) do
+    _reference = Process.monitor(pid_to_monitor)
+    loop(nil)
+  end
+
+  def loop(state) do
+    receive do
+      {:DOWN, reference, :process, pid_that_died, reason} ->
+        new_state = %{pid_that_died: pid_that_died, exit_reason: reason, reference: reference}
+        loop(new_state)
+
+      {:show_state, sender} ->
+        send(sender, {:state, state})
+        loop(state)
+    end
+  end
+end
+
+pid1 = spawn(Process1, :loop, [])
+
+pid2 = spawn(Process2, :init, [pid1])
+```
+
+```elixir
+{Process.alive?(pid1), Process.alive?(pid2)}
+```
+
+```elixir
+send(pid1, :crash_and_burn)
+```
+
+```elixir
+{Process.alive?(pid1), Process.alive?(pid2)}
+```
+
+```elixir
+send(pid2, {:show_state, self()})
+
+receive do
+  {:state, state} -> state
+end
+```
+
+## Monitoring Normal Exits
+
+If a process exits normally, monitoring pocesses receive messages, too.
+
+```elixir
+defmodule Process1 do
+  def loop do
+    receive do
+      :quit -> :ok
+    end
+  end
+end
+
+defmodule Process2 do
+  def init(pid_to_monitor) do
+    _reference = Process.monitor(pid_to_monitor)
+    loop(nil)
+  end
+
+  def loop(state) do
+    receive do
+      {:DOWN, reference, :process, pid_that_died, reason} ->
+        new_state = %{pid_that_died: pid_that_died, exit_reason: reason, reference: reference}
+        loop(new_state)
+
+      {:show_state, sender} ->
+        send(sender, {:state, state})
+        loop(state)
+    end
+  end
+end
+
+pid1 = spawn(Process1, :loop, [])
+
+pid2 = spawn(Process2, :init, [pid1])
+```
+
+```elixir
+{Process.alive?(pid1), Process.alive?(pid2)}
+```
+
+```elixir
+send(pid1, :quit)
+```
+
+```elixir
+{Process.alive?(pid1), Process.alive?(pid2)}
+```
+
+```elixir
+send(pid2, {:show_state, self()})
+
+receive do
+  {:state, state} -> state
+end
+```
+
+## Using References To Catch Exits From Specific Monitored Processes
+
+Each monitor has a unique identifier. These identifiers have their own type: `Reference`.
+A `Reference` value is guaranteed to be unique among all connected nodes in an Erlang cluster.
+
+You can use a reference to expect a message from a specific monitored process.
+
+```elixir
+defmodule Process1 do
+  def loop do
+    receive do
+      :quit -> :ok
+    end
+  end
+end
+
+defmodule Process2 do
+  def init(pid1_to_monitor, pid2_to_monitor) do
+    reference1 = Process.monitor(pid1_to_monitor)
+    reference2 = Process.monitor(pid2_to_monitor)
+    state = %{reference1: reference1, reference2: reference2, who_died: nil}
+    loop(state)
+  end
+
+  def loop(state) do
+    %{reference1: reference1, reference2: reference2} = state
+
+    receive do
+      {:DOWN, ^reference1, :process, _pid_that_died, _reason} ->
+        new_state = %{state | who_died: "Process 1 died"}
+        loop(new_state)
+
+      {:DOWN, ^reference2, :process, _pid_that_died, _reason} ->
+        new_state = %{state | who_died: "Process 2 died"}
+        loop(new_state)
+
+      {:show_state, sender} ->
+        send(sender, {:state, state})
+        loop(state)
+    end
+  end
+end
+
+pid1 = spawn(Process1, :loop, [])
+pid2 = spawn(Process1, :loop, [])
+
+pid = spawn(Process2, :init, [pid1, pid2])
+```
+
+```elixir
+{Process.alive?(pid1), Process.alive?(pid2), Process.alive?(pid)}
+```
+
+```elixir
+send(pid2, :quit)
+```
+
+```elixir
+send(pid, {:show_state, self()})
+
+receive do
+  {:state, state} -> state
+end
+```
+
+## Demonitoring
+
+It is possible to stop monitoring a process.
+
+```elixir
+defmodule Process1 do
+  def loop do
+    receive do
+      :quit -> :ok
+    end
+  end
+end
+
+defmodule Process2 do
+  def init(pid_to_monitor) do
+    reference = Process.monitor(pid_to_monitor)
+    loop(%{reference: reference, down_message_received: false})
+  end
+
+  def loop(state) do
+    receive do
+      {:DOWN, _reference, :process, _pid_that_died, _reason} ->
+        new_state = %{state | down_message_received: true}
+        loop(new_state)
+
+      :demonitor ->
+        Process.demonitor(state[:reference])
+        new_state = %{state | reference: nil}
+        loop(new_state)
+
+      {:show_state, sender} ->
+        send(sender, {:state, state})
+        loop(state)
+    end
+  end
+end
+
+pid1 = spawn(Process1, :loop, [])
+
+pid2 = spawn(Process2, :init, [pid1])
+```
+
+```elixir
+{Process.alive?(pid1), Process.alive?(pid2)}
+```
+
+```elixir
+send(pid2, :demonitor)
+```
+
+```elixir
+send(pid1, :quit)
+```
+
+```elixir
+{Process.alive?(pid1), Process.alive?(pid2)}
+```
+
+```elixir
+send(pid2, {:show_state, self()})
+
+receive do
+  {:state, state} -> state
+end
+```
+
+## Two Monitors Between Two Processes
+
+```elixir
+defmodule Process1 do
+  def loop do
+    receive do
+      :quit -> :ok
+    end
+  end
+end
+
+defmodule Process2 do
+  def init(pid_to_monitor) do
+    reference1 = Process.monitor(pid_to_monitor)
+    reference2 = Process.monitor(pid_to_monitor)
+    state = %{reference1: reference1, reference2: reference2, messages: []}
+    loop(state)
+  end
+
+  def loop(state) do
+    %{reference1: reference1, reference2: reference2} = state
+
+    receive do
+      {:DOWN, ^reference1, :process, _pid_that_died, _reason} ->
+        new_state = %{state | messages: ["Message from ref 1" | state[:messages]]}
+        loop(new_state)
+
+      {:DOWN, ^reference2, :process, _pid_that_died, _reason} ->
+        new_state = %{state | messages: ["Message from ref 2" | state[:messages]]}
+        loop(new_state)
+
+      {:show_state, sender} ->
+        send(sender, {:state, state})
+        loop(state)
+    end
+  end
+end
+
+pid_to_monitor = spawn(Process1, :loop, [])
+
+pid = spawn(Process2, :init, [pid_to_monitor])
+```
+
+```elixir
+{Process.alive?(pid), Process.alive?(pid_to_monitor)}
+```
+
+```elixir
+send(pid_to_monitor, :quit)
+```
+
+```elixir
+{Process.alive?(pid), Process.alive?(pid_to_monitor)}
+```
+
+```elixir
+send(pid, {:show_state, self()})
+
+receive do
+  {:state, state} -> state
+end
+```
+
+## Links vs Monitors
+
+Links are most often used to create a structure of your application, indirectly via supervisors and the
+OTP supervision tree.
+
+Monitors are used a lot when one process need to be aware of what is going on with another process for a
+short period of time.
+
+A good example of using a monitor is when we talk to a genserver and use `Genserver.call()`.
+If an error happens in that genserver, the error is propagated to the process from which we are calling
+`Genserver.call()`. It seems natural after coming from mainstream languages, but why does it happen?
+The process of the genserver and the client process might be totally isolated and have no link between them.
+
+The answer lies [here](https://github.com/erlang/otp/blob/master/lib/stdlib/src/gen.erl#L204).
+
+## Summary
+
+* Monitors are unidirectional
+* A monitoring process does not crash, unless you code it to crash
+* Each monitor has a unique identifier of type `Reference` which you can use to receive messages
+  from a specific process, and not from the whole world
+* Even though you can unlink a link between two processes, just like you can demonitor a monitor,
+  demonitoring of monitors is common pattern in OTP when one process needs to be aware of what's happening
+  in another process for a short period of time.

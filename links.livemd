@@ -836,3 +836,454 @@ The answer lies [here](https://github.com/erlang/otp/blob/master/lib/stdlib/src/
 * Even though you can unlink a link between two processes, just like you can demonitor a monitor,
   demonitoring of monitors is common pattern in OTP when one process needs to be aware of what's happening
   in another process for a short period of time.
+
+## You Own Supervisor
+
+In the first code chunk we perform some magic with Erlang I/O in order to see what is printed to
+STDOUT in Livebook. If you want to understand, load and study
+[this livebook](https://raw.githubusercontent.com/jonatanklosko/notebooks/main/notebooks/io_architecture.livemd).
+
+```elixir
+defmodule IODev do
+  @moduledoc """
+  A simple IO device implementing the The Erlang I/O Protocol.
+  """
+
+  use GenServer
+
+  def start_link() do
+    GenServer.start_link(__MODULE__, [])
+  end
+
+  @doc """
+  Lists all IO requests sent to this device.
+  """
+  def get_requests(pid) do
+    GenServer.call(pid, :get_requests)
+  end
+
+  @impl true
+  def init(_opts) do
+    {:ok, %{requests: []}}
+  end
+
+  @impl true
+  def handle_call(:get_requests, _from, state) do
+    {:reply, Enum.reverse(state.requests), %{requests: []}}
+  end
+
+  # Below we handle the actual IO requests
+
+  @impl true
+  def handle_info({:io_request, from, reply_as, request}, state) do
+    # Send reply to the process that requested IO
+    send(from, {:io_reply, reply_as, :ok})
+
+    # Store all the incoming requests
+    state = update_in(state.requests, &[request | &1])
+
+    {:noreply, state}
+  end
+end
+
+{:ok, io_dev} = IODev.start_link()
+original_group_leader = Process.group_leader()
+# Set our custom device as the new group leader
+Process.group_leader(self(), io_dev)
+```
+
+A worker that won't crash:
+
+```elixir
+defmodule CountDown do
+  def start_link(times) when times > 0 do
+    spawn_link(fn -> loop(times) end)
+  end
+
+  def loop(0) do
+    IO.puts("exiting...")
+  end
+
+  def loop(times) do
+    receive do
+    after
+      100 ->
+        IO.puts("good countdown: #{times}")
+        loop(times - 1)
+    end
+  end
+end
+```
+
+```elixir
+CountDown.start_link(10)
+```
+
+```elixir
+IODev.get_requests(io_dev)
+```
+
+A worker that will crash:
+
+```elixir
+defmodule BadCountDown do
+  def start_link(times) when times > 0 do
+    # spawn_link will crash the livebook process if we call start_link directly
+    # spawn_link(fn -> loop(times) end)
+    spawn(fn -> loop(times) end)
+  end
+
+  def loop(0), do: :ok
+  def loop(6), do: 1 / 0
+
+  def loop(times) do
+    receive do
+    after
+      100 ->
+        IO.puts("bad countdown: #{times}")
+        loop(times - 1)
+    end
+  end
+end
+```
+
+```elixir
+BadCountDown.start_link(10)
+```
+
+```elixir
+IODev.get_requests(io_dev)
+```
+
+This is the API we want to use for our supervisor:
+
+```elixir
+SuperNaiveSupervisor.start_link([
+  {CountDown, :start_link, [10]},
+  {BadCountDown, :start_link, [10]}
+])
+```
+
+SuperNaiveSupervisor will
+
+* spawn child processes
+* if a process exits normally, do nothing
+* if a process exits abnormally, restart it
+
+The structure of the supervisor:
+
+```elixir
+defmodule SuperNaiveSupervisor do
+  def start_link(_child_specifications) do
+    # spawn a process of the supervisor
+  end
+
+  def init(_child_specifications) do
+    # set trap_exit to true
+    # spawn and link processes according to the specifications
+    # create the state structure which look as follows:
+    # %{
+    #   #PID<0.260.0> => {CountDown, :start_link, [10]},
+    #   #PID<0.261.0> => {BadCountDown, :start_link, [10]}
+    # }
+    # call loop
+  end
+
+  defp start_child(_spec = {_mod, _fun, _args}) do
+    # spawn and link a processe according to the specification
+  end
+
+  def loop(_state) do
+    # receive with 2 clauses:
+    # * for a normal exit:
+    #   * remove the child spec from the state
+    #   * call loop()
+    # * for an abnormal exit:
+    #   * re-start the child
+    #   * update the state
+    #   * call loop()
+  end
+end
+```
+
+Let's redefine `BadCountDown` with `spawn_link`, and not just `spawn`:
+
+```elixir
+defmodule BadCountDown do
+  def start_link(times) when times > 0 do
+    spawn_link(fn -> loop(times) end)
+  end
+
+  def loop(0), do: :ok
+  def loop(6), do: 1 / 0
+
+  def loop(times) do
+    receive do
+    after
+      100 ->
+        IO.puts("bad countdown: #{times}")
+        loop(times - 1)
+    end
+  end
+end
+```
+
+Functional supervisor:
+
+```elixir
+defmodule SuperNaiveSupervisor do
+  def start_link(child_specifications) do
+    spawn(__MODULE__, :init, [child_specifications])
+  end
+
+  def init(child_specifications) do
+    Process.flag(:trap_exit, true)
+
+    state =
+      child_specifications
+      |> Enum.map(&start_child/1)
+      |> Enum.into(Map.new())
+
+    loop(state)
+  end
+
+  defp loop(state) do
+    receive do
+      {:EXIT, pid_just_exited, :normal} ->
+        IO.puts(["child ", inspect(pid_just_exited), " has exited normally"])
+        new_state = Map.delete(state, pid_just_exited)
+        loop(new_state)
+
+      {:EXIT, pid_just_exited, _reason} ->
+        {:ok, child_spec} = Map.fetch(state, pid_just_exited)
+
+        IO.puts(["restarting", inspect(child_spec, charlists: :as_lists)])
+        {new_pid, _} = start_child(child_spec)
+
+        new_state =
+          state
+          |> Map.delete(pid_just_exited)
+          |> Map.put(new_pid, child_spec)
+
+        loop(new_state)
+    end
+  end
+
+  defp start_child(spec = {mod, fun, args}) do
+    # where is linking and spawning?
+    case apply(mod, fun, args) do
+      pid when is_pid(pid) -> {pid, spec}
+      _ -> :error
+    end
+  end
+end
+```
+
+Let's test it with a child that exits normally:
+
+```elixir
+SuperNaiveSupervisor.start_link([
+  {CountDown, :start_link, [10]}
+])
+```
+
+```elixir
+IODev.get_requests(io_dev)
+```
+
+And now with a bad process:
+
+```elixir
+sup_pid =
+  SuperNaiveSupervisor.start_link([
+    {CountDown, :start_link, [10]},
+    {BadCountDown, :start_link, [10]}
+  ])
+```
+
+```elixir
+IODev.get_requests(io_dev)
+```
+
+The supervisor keeps restarting the bad child, so let's clean up by killing the supervisor:
+
+```elixir
+Process.exit(sup_pid, :kill)
+```
+
+## Supervisor Exits After Too Many Restarts Of A Child
+
+The code above has many problems.
+
+One of them is that the supervisor tries restarting a failing child forever.
+This is not what supervisors do.
+
+Let's make sure that the supervisor tries restarting a failing child N times and
+if the problem persists, the supervisor exits.
+
+```elixir
+defmodule SuperNaiveSupervisor do
+  @max_restarts 3
+
+  def start_link(child_specifications) do
+    spawn(__MODULE__, :init, [child_specifications])
+  end
+
+  def init(child_specifications) do
+    Process.flag(:trap_exit, true)
+
+    state =
+      child_specifications
+      |> Enum.map(&start_child/1)
+      |> Enum.map(fn {pid, spec} -> {pid, {spec, @max_restarts}} end)
+      |> Enum.into(Map.new())
+
+    # %{
+    #   #PID<0.260.0> => {{CountDown, :start_link, [10]}, 3},
+    #   #PID<0.261.0> => {{BadCountDown, :start_link, [10]}, 3}
+    # }
+
+    loop(state)
+  end
+
+  defp loop(state) do
+    receive do
+      {:EXIT, pid_just_exited, :normal} ->
+        IO.puts(["child ", inspect(pid_just_exited), " has exited normally"])
+        new_state = Map.delete(state, pid_just_exited)
+        loop(new_state)
+
+      {:EXIT, pid_just_exited, reason} ->
+        case Map.fetch(state, pid_just_exited) do
+          {:ok, {_child_spec, 0}} ->
+            reason = {:sup_giving_up, reason}
+            IO.puts("Supervisor giving up, reason:  #{inspect(reason)}}")
+            exit(reason)
+
+          {:ok, {child_spec, counter}} ->
+            IO.puts(["restarting", inspect(child_spec, charlists: :as_lists)])
+            {new_pid, _} = start_child(child_spec)
+
+            new_state =
+              state
+              |> Map.delete(pid_just_exited)
+              |> Map.put(new_pid, {child_spec, counter - 1})
+
+            loop(new_state)
+        end
+    end
+  end
+
+  defp start_child(spec = {mod, fun, args}) do
+    case apply(mod, fun, args) do
+      pid when is_pid(pid) -> {pid, spec}
+      _ -> :error
+    end
+  end
+end
+```
+
+```elixir
+sup_pid =
+  SuperNaiveSupervisor.start_link([
+    {BadCountDown, :start_link, [10]}
+  ])
+```
+
+```elixir
+IODev.get_requests(io_dev)
+```
+
+## Treating Process.exit() Differently
+
+Another problem is  that if we kill a child with `Process.exit()`,
+the supervisor will restart it!
+
+We need a way to differentiate between abnormal exits and exits
+caused by `Process.exit()`.
+
+This is possible because the reason in exits caused by `Process.exit()` is `killed`.
+
+```elixir
+defmodule SuperNaiveSupervisor do
+  @max_restarts 3
+
+  def start_link(child_specifications) do
+    spawn(__MODULE__, :init, [child_specifications])
+  end
+
+  def init(child_specifications) do
+    Process.flag(:trap_exit, true)
+
+    state =
+      child_specifications
+      |> Enum.map(&start_child/1)
+      |> Enum.map(fn {pid, spec} -> {pid, {spec, @max_restarts}} end)
+      |> Enum.into(Map.new())
+
+    loop(state)
+  end
+
+  defp loop(state) do
+    receive do
+      {:EXIT, pid_just_exited, :normal} ->
+        IO.puts(["child ", inspect(pid_just_exited), " has exited normally"])
+        new_state = Map.delete(state, pid_just_exited)
+        loop(new_state)
+
+      # # !!!
+      {:EXIT, pid_just_exited, :killed} ->
+        IO.puts(["child ", inspect(pid_just_exited), " has been killed"])
+        new_state = Map.delete(state, pid_just_exited)
+        loop(new_state)
+
+      {:EXIT, pid_just_exited, reason} ->
+        case Map.fetch(state, pid_just_exited) do
+          {:ok, {_child_spec, 0}} ->
+            reason = {:sup_giving_up, reason}
+            IO.puts("Supervisor giving up, reason:  #{inspect(reason)}}")
+            exit(reason)
+
+          {:ok, {child_spec, counter}} ->
+            IO.puts(["restarting", inspect(child_spec, charlists: :as_lists)])
+            {new_pid, _} = start_child(child_spec)
+
+            new_state =
+              state
+              |> Map.delete(pid_just_exited)
+              |> Map.put(new_pid, {child_spec, counter - 1})
+
+            loop(new_state)
+        end
+    end
+  end
+
+  defp start_child(spec = {mod, fun, args}) do
+    case apply(mod, fun, args) do
+      pid when is_pid(pid) -> {pid, spec}
+      _ -> :error
+    end
+  end
+end
+```
+
+## Restart Strategies
+
+We have just implemented restart strategy `:one_for_one`
+
+* `:one_for_one` - if a child process terminates,
+  only that process is restarted.
+* `:one_for_all` - if a child process terminates,
+  all other child processes are terminated and then
+  all child processes (including the terminated one) are restarted.
+* `:rest_for_one` - if a child process terminates,
+  the terminated child process and the rest of the children started after it, are terminated and restarted.
+
+Homework:
+
+1. Read (or re-read)
+   [the supervisors documentation](https://hexdocs.pm/elixir/1.12/Supervisor.html#module-strategies),
+   especially the part about
+   [restart strategies](https://hexdocs.pm/elixir/1.12/Supervisor.html#module-strategies)
+   and options `max_restarts` and `max_seconds`
+2. Implement restart strategy `:one_for_all`
